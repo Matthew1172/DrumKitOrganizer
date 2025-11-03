@@ -1,11 +1,15 @@
 import os
+import sys
 import argparse
 import shutil
 from collections import Counter, defaultdict
 
 import numpy as np
-from sklearn.cluster import MiniBatchKMeans
-from sklearn.preprocessing import StandardScaler
+
+# You don't strictly need these now, but leaving them in case you reuse
+# the GPU feature pipeline later.
+from sklearn.cluster import MiniBatchKMeans  # unused in current flow
+from sklearn.preprocessing import StandardScaler  # unused in current flow
 
 import torch
 import torchaudio
@@ -15,15 +19,34 @@ import torchaudio
 # ---------------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ---------------------------------------
+# DrumClassifier imports (your CNN-LSTM)
+# ---------------------------------------
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+CODE_DIR = os.path.join(THIS_DIR, "code")
+if CODE_DIR not in sys.path:
+    sys.path.append(CODE_DIR)
+
+try:
+    from drumclassifier_utils import DrumClassifier
+    from drumclassifier_constants import INSTRUMENT_NAMES
+except ImportError as e:
+    print("ERROR: Could not import DrumClassifier modules.")
+    print("Make sure 'code/' with drumclassifier_utils.py and "
+          "drumclassifier_constants.py is on PYTHONPATH.")
+    print(f"Details: {e}")
+    sys.exit(1)
+
 
 # ---------------------------------------
-# 1. Audio feature extraction (GPU batch)
+# 1. (Optional) Audio feature extraction (GPU batch)
+#    Not used in the new flow, but kept for future KMeans-within-class.
 # ---------------------------------------
 
 def build_mel_transform(sample_rate=22050, n_mels=64):
     """
     Build a MelSpectrogram transform on the GPU.
-    We’ll take mean/std over time of log-mel to get a feature vector.
     """
     transform = torchaudio.transforms.MelSpectrogram(
         sample_rate=sample_rate,
@@ -42,18 +65,8 @@ def extract_features_torch_batch(
     max_duration=2.0,
 ):
     """
-    Extract features for a batch of files:
-
-    - Load audio (CPU, torchaudio)
-    - Convert to mono, resample to target_sr
-    - Trim to max_duration
-    - Pad batch to same length, move to GPU
-    - Compute mel spectrogram on GPU
-    - Return mean/std over time of log-mel (on CPU as numpy)
-
-    Returns:
-      valid_paths: list[str]
-      feats: np.ndarray, shape (B, 2 * n_mels)
+    Extract log-mel mean/std features for a batch of files (GPU).
+    Not used in the main flow now.
     """
     wave_list = []
     valid_paths = []
@@ -122,8 +135,16 @@ def collect_files(root, exts):
     return paths
 
 
+def collect_dirs(root):
+    dirs = []
+    for dirpath, _, _ in os.walk(root):
+        dirs.append(dirpath)
+    return dirs
+
+
 # ---------------------------------------
-# 3. Smart cluster naming
+# 3. Smart cluster naming (still here if you ever
+#    want to run KMeans within each instrument class)
 # ---------------------------------------
 
 TOKEN_MAP = {
@@ -196,20 +217,18 @@ def infer_cluster_name(file_paths, max_tokens_for_name=2):
 
     return "misc"
 
+
 # ---------------------------------------
-# 4. Main clustering + organizing
+# 4. Main organizing (DrumClassifier-based)
 # ---------------------------------------
 
 def cluster_and_organize(
     source_root,
     dest_root,
-    n_clusters=10,
     move=False,
     exts=(".wav", ".mp3", ".flac", ".aif", ".aiff", ".ogg"),
-    batch_size=128,
-    target_sr=22050,
-    n_mels=64,
-    max_duration=2.0,
+    model_path="C:\\Users\\pecko\\MatthewCode\\DrumClassifer-CNN-LSTM\\models\\mel_cnn_models\\mel_cnn_model_high_v2.model",
+    min_conf=0.5,
 ):
 
     source_root = os.path.abspath(source_root)
@@ -224,70 +243,66 @@ def cluster_and_organize(
         print("No audio files found. Exiting.")
         return
 
-    mel_transform = build_mel_transform(sample_rate=target_sr, n_mels=n_mels)
+    # Load DrumClassifier
+    print("Loading DrumClassifier model...")
+    drumcl = DrumClassifier(path_to_model=model_path)
+    print("Model loaded.")
 
-    # ---- Batch feature extraction with GPU ----
-    print("Extracting features on GPU (batched)...")
-    feature_list = []
-    valid_files = []
+    # Classify all files by walking directories and calling
+    # predict_proba_directory on each (so nested folders are covered).
+    print("Classifying files with DrumClassifier...")
+    dirs = collect_dirs(source_root)
+    results = {}  # path -> {pred_class, max_prob}
 
-    total = len(files)
-    for start in range(0, total, batch_size):
-        end = min(start + batch_size, total)
-        batch_paths = files[start:end]
+    for idx, d in enumerate(dirs, 1):
+        try:
+            prob_dict = drumcl.predict_proba_directory(d, format="prob")
+        except Exception as e:
+            print(f"[WARN] Error classifying directory {d}: {e}")
+            continue
 
-        v_paths, feats = extract_features_torch_batch(
-            batch_paths,
-            mel_transform=mel_transform,
-            target_sr=target_sr,
-            max_duration=max_duration,
-        )
+        if not prob_dict:
+            continue
 
-        if feats is not None and len(v_paths) > 0:
-            # feats is currently (B, 1, 128) → flatten to (B, 128)
-            feats = feats.reshape(feats.shape[0], -1)
-            valid_files.extend(v_paths)
-            feature_list.append(feats)
+        for path, probs in prob_dict.items():
+            if not is_audio_file(path, exts):
+                continue
 
-        print(f"Processed {end}/{total} files...")
+            probs_arr = np.asarray(probs, dtype=float)
+            if probs_arr.size != len(INSTRUMENT_NAMES):
+                print(f"[WARN] Unexpected prob length for {path}: {probs_arr.size}")
+                continue
 
-    if not feature_list:
-        print("No valid features extracted. Exiting.")
+            max_idx = int(np.argmax(probs_arr))
+            max_prob = float(probs_arr[max_idx])
+            label = INSTRUMENT_NAMES[max_idx]
+
+            if max_prob < min_conf:
+                pred_class = "unknown"
+            else:
+                pred_class = label
+
+            abs_path = os.path.abspath(path)
+            results[abs_path] = {
+                "pred_class": pred_class,
+                "max_prob": max_prob,
+            }
+
+        if idx % 10 == 0:
+            print(f"Processed {idx}/{len(dirs)} directories...")
+
+    if not results:
+        print("No classification results. Exiting.")
         return
 
-    # Filter out any empty batches (safety)
-    feature_list = [f for f in feature_list if f is not None and f.size > 0]
+    # Group by predicted class
+    class_to_files = defaultdict(list)
+    for path, info in results.items():
+        class_to_files[info["pred_class"]].append(path)
 
-    # Stack into (N_total_files, n_features)
-    X = np.vstack(feature_list)
-    print(f"Feature matrix shape: {X.shape}")
-
-    # Normalize features
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # Clustering
-    print(f"Clustering into {n_clusters} clusters with MiniBatchKMeans...")
-    kmeans = MiniBatchKMeans(
-        n_clusters=n_clusters,
-        random_state=42,
-        batch_size=256,
-        n_init="auto",
-        max_iter=200,
-    )
-    labels = kmeans.fit_predict(X_scaled)
-
-    # Group files by cluster
-    cluster_to_files = defaultdict(list)
-    for path, label in zip(valid_files, labels):
-        cluster_to_files[label].append(path)
-
-    # Infer names for each cluster
-    print("Inferring cluster names...")
-    cluster_names = {}
-    for cluster_id, paths in cluster_to_files.items():
-        base_name = infer_cluster_name(paths)
-        cluster_names[cluster_id] = base_name
+    print("Class distribution:")
+    for cls in sorted(class_to_files.keys()):
+        print(f"  {cls}: {len(class_to_files[cls])} files")
 
     # Make folders and move/copy files
     os.makedirs(dest_root, exist_ok=True)
@@ -306,14 +321,13 @@ def cluster_and_organize(
             i += 1
 
     file_count = 0
-    for cluster_id, paths in cluster_to_files.items():
-        base_name = cluster_names[cluster_id]
-        folder_name = f"{cluster_id:02d}_{base_name}"
-        cluster_folder = os.path.join(dest_root, folder_name)
-        os.makedirs(cluster_folder, exist_ok=True)
+    for cls, paths in class_to_files.items():
+        folder_name = cls  # e.g. "kick", "snr", "hho", "808", "fx", "unknown"
+        class_folder = os.path.join(dest_root, folder_name)
+        os.makedirs(class_folder, exist_ok=True)
 
         for src_path in paths:
-            dst_path = os.path.join(cluster_folder, os.path.basename(src_path))
+            dst_path = os.path.join(class_folder, os.path.basename(src_path))
             dst_path = ensure_unique_path(dst_path)
 
             try:
@@ -329,10 +343,11 @@ def cluster_and_organize(
             if file_count % 50 == 0:
                 print(f"{action} {file_count} files...")
 
-    print(f"Done. Processed {file_count} files into {len(cluster_to_files)} clusters.")
-    print("Cluster folders created:")
-    for cid in sorted(cluster_names.keys()):
-        print(f"  {cid:02d}: {cluster_names[cid]}")
+    print(f"Done. Processed {file_count} files into {len(class_to_files)} classes.")
+    print("Folders created:")
+    for cls in sorted(class_to_files.keys()):
+        print(f"  {cls}: {len(class_to_files[cls])} files")
+
 
 # ---------------------------------------
 # 5. CLI
@@ -340,16 +355,10 @@ def cluster_and_organize(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Cluster drum one-shots with GPU-accelerated log-mel features and auto-name folders."
+        description="Organize drum one-shots using DrumClassifier CNN-LSTM classes."
     )
     parser.add_argument("source", help="Root folder containing all your drum kits")
-    parser.add_argument("dest", help="Destination folder for the clustered kit")
-    parser.add_argument(
-        "--n-clusters",
-        type=int,
-        default=10,
-        help="Number of clusters for KMeans (default: 10)",
-    )
+    parser.add_argument("dest", help="Destination folder for the organized kit")
     parser.add_argument(
         "--move",
         action="store_true",
@@ -361,28 +370,15 @@ def main():
         help="Comma-separated list of audio extensions",
     )
     parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=128,
-        help="Batch size for GPU feature extraction (default: 128)",
+        "--model-path",
+        default="C:\\Users\\pecko\\MatthewCode\\DrumClassifer-CNN-LSTM\\models\\mel_cnn_models\\mel_cnn_model_high_v2.model",
+        help="Path to DrumClassifier .model file",
     )
     parser.add_argument(
-        "--target-sr",
-        type=int,
-        default=22050,
-        help="Target sample rate for resampling (default: 22050)",
-    )
-    parser.add_argument(
-        "--n-mels",
-        type=int,
-        default=64,
-        help="Number of Mel bands (default: 64)",
-    )
-    parser.add_argument(
-        "--max-duration",
+        "--min-conf",
         type=float,
-        default=2.0,
-        help="Max audio duration in seconds (default: 2.0)",
+        default=0.5,
+        help="Minimum confidence to trust a class; otherwise goes to 'unknown' (default: 0.5)",
     )
 
     args = parser.parse_args()
@@ -391,13 +387,10 @@ def main():
     cluster_and_organize(
         source_root=args.source,
         dest_root=args.dest,
-        n_clusters=args.n_clusters,
         move=args.move,
         exts=exts,
-        batch_size=args.batch_size,
-        target_sr=args.target_sr,
-        n_mels=args.n_mels,
-        max_duration=args.max_duration,
+        model_path=args.model_path,
+        min_conf=args.min_conf,
     )
 
 

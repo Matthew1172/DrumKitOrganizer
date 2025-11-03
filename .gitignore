@@ -1,1 +1,4 @@
 samples/
+outputs/
+drum_cnn.pt
+__pycache__/
